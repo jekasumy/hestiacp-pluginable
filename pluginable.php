@@ -612,10 +612,22 @@ if ( !class_exists( 'HCPP') ) {
                 '${BASH_REMATCH[1]}.${BASH_REMATCH[2]}${BASH_REMATCH[3]}'
             );
 
-            // Comment out disable_functions in php.ini 
-            // (undo https://github.com/hestiacp/hestiacp/blob/main/CHANGELOG.md#1810---service-release)
-            shell_exec( 'sed -i \'s/^disable_functions =/;disable_functions =/g\' /etc/php/*/fpm/php.ini' );
-            shell_exec( 'sed -i \'s/^disable_functions =/;disable_functions =/g\' /etc/php/*/cli/php.ini' );
+            // PATCH: do not switch off disable_functions completely. In every fpm and cli php.ini only the
+            // functions pluginable needs are removed from the list; everything else stays disabled.
+            // The original list is saved next to php.ini (php.ini.hcpp.bak) and restored on uninstall.
+            $hcpp_allow = [ 'exec', 'shell_exec', 'proc_open', 'posix_getpwuid', 'posix_getuid', 'curl_init', 'curl_exec' ];
+            foreach ( glob( '/etc/php/*/{fpm,cli}/php.ini', GLOB_BRACE ) as $ini ) {
+                $content = file_get_contents( $ini );
+                if ( $content === false || ! preg_match( '/^;?disable_functions\s*=[ \t]*(.*)$/m', $content, $orig ) ) continue;
+                if ( ! file_exists( "$ini.hcpp.bak" ) ) file_put_contents( "$ini.hcpp.bak", $orig[1] );
+                $content = preg_replace_callback( '/^;?disable_functions\s*=[ \t]*(.*)$/m', function( $m ) use ( $hcpp_allow ) {
+                    $list = array_filter( array_map( 'trim', explode( ',', $m[1] ) ), function( $f ) use ( $hcpp_allow ) {
+                        return $f !== '' && ! in_array( $f, $hcpp_allow, true );
+                    } );
+                    return 'disable_functions = ' . implode( ',', $list );
+                }, $content );
+                file_put_contents( $ini, $content );
+            }
 
             // Install the hcpp_rebooted action hook service
             $serviceFile = '/etc/systemd/system/hcpp_rebooted.service';
@@ -819,10 +831,21 @@ if ( !class_exists( 'HCPP') ) {
             // Restore /usr/local/hestia/func/domain.sh
             $this->restore_backup( '/usr/local/hestia/func/domain.sh' );
             
-            // Re-enable disable_functions in php.ini 
-            // (undo https://github.com/hestiacp/hestiacp/blob/main/CHANGELOG.md#1810---service-release)
-            shell_exec( 'sed -i \'s/^;disable_functions =/disable_functions =/g\' /etc/php/*/fpm/php.ini' );
-            shell_exec( 'sed -i \'s/^;disable_functions =/disable_functions =/g\' /etc/php/*/cli/php.ini' );
+            // Re-enable disable_functions in php.ini (PATCH: restore the original list saved at install)
+            foreach ( glob( '/etc/php/*/{fpm,cli}/php.ini', GLOB_BRACE ) as $ini ) {
+                $content = file_get_contents( $ini );
+                if ( $content === false ) continue;
+                if ( file_exists( "$ini.hcpp.bak" ) ) {
+                    $orig = trim( file_get_contents( "$ini.hcpp.bak" ) );
+                    $content = preg_replace_callback( '/^;?disable_functions\s*=[ \t]*(.*)$/m', function( $m ) use ( $orig ) {
+                        return 'disable_functions = ' . $orig;
+                    }, $content );
+                    file_put_contents( $ini, $content );
+                    unlink( "$ini.hcpp.bak" );
+                } else {
+                    file_put_contents( $ini, preg_replace( '/^;disable_functions =/m', 'disable_functions =', $content ) );
+                }
+            }
 
             // Disable and remove the hcpp_rebooted service
             $serviceFile = '/etc/systemd/system/hcpp_rebooted.service';
@@ -1501,10 +1524,7 @@ if ( !isset( $hcpp ) || $hcpp === null ) {
             // Get the remaining arguments after argv[1], if any otherwise set to empty array
             $args = array_slice( $argv, 2 );
 
-            // Remove double slash encoding and double single quotes from arguments
-            $args = array_map(function($arg) {
-                return str_replace(["''",'\\'], ['',''], $arg);
-            }, $args);
+            // PATCH: arguments arrive unmodified from local.conf (no %q encoding), so no stripping here.
             $args = $hcpp->do_action( $bin_command, $args );
 
             // Escape the remaining arguments
@@ -1512,7 +1532,15 @@ if ( !isset( $hcpp ) || $hcpp === null ) {
 
             // Run the original command with the new arguments
             $cmd = "/usr/local/hestia/bin/$argv[1] $args";
-            
+
+            // PATCH: if no plugin hooks the command's output (<command>_output), run it with
+            // inherited stdin/stdout/stderr so output streams in real time (and stdin works),
+            // instead of buffering everything until the command ends.
+            if ( empty( $hcpp->hcpp_filters[ $bin_command . '_output' ] ) ) {
+                $process = proc_open( $cmd, array( 0 => STDIN, 1 => STDOUT, 2 => STDERR ), $pipes, null, null );
+                exit( proc_close( $process ) );
+            }
+
             $descriptorspec = array(
                 0 => array("pipe", "r"),  // stdin is a pipe that the child will read from
                 1 => array("pipe", "w"),  // stdout is a pipe that the child will write to
