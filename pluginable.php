@@ -8,6 +8,8 @@
  * @author Virtuosoft/Stephen J. Carnam
  * @license AGPL-3.0, for other licensing options contact support@virtuosoft.com
  * @link https://github.com/virtuosoft-dev/hestiacp-pluginable
+ *
+ * NOTICE: this is a modified, unofficial fork (modified 2026-10-05); see "Changes in this fork" in README.md.
  * 
  */
 
@@ -133,6 +135,30 @@ if ( !class_exists( 'HCPP') ) {
             
             // Get the DOMXPath object
             $html = ob_get_clean();
+
+            // PATCH: only post-process HTML. Pass images (e.g. /list/rrd/ PNG graphs),
+            // JSON, downloads and any other non-HTML or binary response through untouched.
+            // Previously every response went through DOMDocument and binary data got corrupted.
+            $non_html = false;
+            foreach ( headers_list() as $h ) {
+                if ( stripos( $h, 'content-type:' ) === 0 && stripos( $h, 'text/html' ) === false ) {
+                    $non_html = true;
+                    break;
+                }
+            }
+            if ( ! $non_html && ( strpos( $html, "\0" ) !== false || strncmp( $html, "\x89PNG", 4 ) === 0 || strncmp( $html, "GIF8", 4 ) === 0 || strncmp( $html, "\xFF\xD8", 2 ) === 0 ) ) {
+                $non_html = true;
+            }
+            // PATCH: AJAX/JSON/fragment responses (e.g. /list/rrd/ajax.php) have no document markup;
+            // running them through DOMDocument wraps/mangles them. Only full pages are post-processed.
+            if ( ! $non_html && trim( $html ) !== '' && ! preg_match( '~<(?:!doctype|html|head|body)\b~i', $html ) ) {
+                $non_html = true;
+            }
+            if ( $non_html ) {
+                echo $html;
+                return;
+            }
+
             if ( $html == "" ) $html = "<html><head></head><body></body></html>";
             try {
                 $dom = new DOMDocument();
@@ -612,10 +638,22 @@ if ( !class_exists( 'HCPP') ) {
                 '${BASH_REMATCH[1]}.${BASH_REMATCH[2]}${BASH_REMATCH[3]}'
             );
 
-            // Comment out disable_functions in php.ini 
-            // (undo https://github.com/hestiacp/hestiacp/blob/main/CHANGELOG.md#1810---service-release)
-            shell_exec( 'sed -i \'s/^disable_functions =/;disable_functions =/g\' /etc/php/*/fpm/php.ini' );
-            shell_exec( 'sed -i \'s/^disable_functions =/;disable_functions =/g\' /etc/php/*/cli/php.ini' );
+            // PATCH: do not switch off disable_functions completely. In every fpm and cli php.ini only the
+            // functions pluginable needs are removed from the list; everything else stays disabled.
+            // The original list is saved next to php.ini (php.ini.hcpp.bak) and restored on uninstall.
+            $hcpp_allow = [ 'exec', 'shell_exec', 'proc_open', 'posix_getpwuid', 'posix_getuid', 'curl_init', 'curl_exec' ];
+            foreach ( glob( '/etc/php/*/{fpm,cli}/php.ini', GLOB_BRACE ) as $ini ) {
+                $content = file_get_contents( $ini );
+                if ( $content === false || ! preg_match( '/^;?disable_functions\s*=[ \t]*(.*)$/m', $content, $orig ) ) continue;
+                if ( ! file_exists( "$ini.hcpp.bak" ) ) file_put_contents( "$ini.hcpp.bak", $orig[1] );
+                $content = preg_replace_callback( '/^;?disable_functions\s*=[ \t]*(.*)$/m', function( $m ) use ( $hcpp_allow ) {
+                    $list = array_filter( array_map( 'trim', explode( ',', $m[1] ) ), function( $f ) use ( $hcpp_allow ) {
+                        return $f !== '' && ! in_array( $f, $hcpp_allow, true );
+                    } );
+                    return 'disable_functions = ' . implode( ',', $list );
+                }, $content );
+                file_put_contents( $ini, $content );
+            }
 
             // Install the hcpp_rebooted action hook service
             $serviceFile = '/etc/systemd/system/hcpp_rebooted.service';
@@ -819,10 +857,21 @@ if ( !class_exists( 'HCPP') ) {
             // Restore /usr/local/hestia/func/domain.sh
             $this->restore_backup( '/usr/local/hestia/func/domain.sh' );
             
-            // Re-enable disable_functions in php.ini 
-            // (undo https://github.com/hestiacp/hestiacp/blob/main/CHANGELOG.md#1810---service-release)
-            shell_exec( 'sed -i \'s/^;disable_functions =/disable_functions =/g\' /etc/php/*/fpm/php.ini' );
-            shell_exec( 'sed -i \'s/^;disable_functions =/disable_functions =/g\' /etc/php/*/cli/php.ini' );
+            // Re-enable disable_functions in php.ini (PATCH: restore the original list saved at install)
+            foreach ( glob( '/etc/php/*/{fpm,cli}/php.ini', GLOB_BRACE ) as $ini ) {
+                $content = file_get_contents( $ini );
+                if ( $content === false ) continue;
+                if ( file_exists( "$ini.hcpp.bak" ) ) {
+                    $orig = trim( file_get_contents( "$ini.hcpp.bak" ) );
+                    $content = preg_replace_callback( '/^;?disable_functions\s*=[ \t]*(.*)$/m', function( $m ) use ( $orig ) {
+                        return 'disable_functions = ' . $orig;
+                    }, $content );
+                    file_put_contents( $ini, $content );
+                    unlink( "$ini.hcpp.bak" );
+                } else {
+                    file_put_contents( $ini, preg_replace( '/^;disable_functions =/m', 'disable_functions =', $content ) );
+                }
+            }
 
             // Disable and remove the hcpp_rebooted service
             $serviceFile = '/etc/systemd/system/hcpp_rebooted.service';
@@ -979,7 +1028,7 @@ if ( !class_exists( 'HCPP') ) {
             }
             sleep(mt_rand(1, 30)); // stagger actual update check
             $this->log( 'Running self update...' );
-            $url = 'https://github.com/virtuosoft-dev/hestiacp-pluginable';
+            $url = 'https://github.com/jekasumy/hestiacp-pluginable-alt'; // PATCH: fork repository (was upstream virtuosoft-dev/hestiacp-pluginable)
             $installed_version = $this->get_repo_folder_tag( '/etc/hestiacp/hooks' );
             $latest_version = $this->find_latest_repo_tag( $url );
             $this->log( 'Installed version: ' . $installed_version . ', Latest version: ' . $latest_version );
@@ -1250,7 +1299,8 @@ if ( !isset( $hcpp ) || $hcpp === null ) {
             try {
                 $scriptElement = $xpath->document->createElement('script');
                 $scriptElement->setAttribute('src', '/js/dist/jquery-3.7.1.min.js');
-                $xpath->query('/html/head')->item(0)->appendChild($scriptElement);  
+                $head = $xpath->query('/html/head')->item(0); // PATCH: null-safe (non-page responses)
+                if ( $head ) $head->appendChild($scriptElement);
             }catch( Exception $e ) {
                 $hcpp->log( $e->getMessage() );
             }
@@ -1369,7 +1419,7 @@ if ( !isset( $hcpp ) || $hcpp === null ) {
 
             // List of folders and their git repo urls to list in the update output
             $git_folder_url = [
-                ['/etc/hestiacp/hooks', 'https://github.com/virtuosoft-dev/hestiacp-pluginable.git'] // HestiaCP Pluginable core
+                ['/etc/hestiacp/hooks', 'https://github.com/jekasumy/hestiacp-pluginable-alt.git'] // HestiaCP Pluginable core
             ];
 
             // Add any plugins from /usr/local/hestia/plugins to list
@@ -1501,10 +1551,7 @@ if ( !isset( $hcpp ) || $hcpp === null ) {
             // Get the remaining arguments after argv[1], if any otherwise set to empty array
             $args = array_slice( $argv, 2 );
 
-            // Remove double slash encoding and double single quotes from arguments
-            $args = array_map(function($arg) {
-                return str_replace(["''",'\\'], ['',''], $arg);
-            }, $args);
+            // PATCH: arguments arrive unmodified from local.conf (no %q encoding), so no stripping here.
             $args = $hcpp->do_action( $bin_command, $args );
 
             // Escape the remaining arguments
@@ -1512,7 +1559,15 @@ if ( !isset( $hcpp ) || $hcpp === null ) {
 
             // Run the original command with the new arguments
             $cmd = "/usr/local/hestia/bin/$argv[1] $args";
-            
+
+            // PATCH: if no plugin hooks the command's output (<command>_output), run it with
+            // inherited stdin/stdout/stderr so output streams in real time (and stdin works),
+            // instead of buffering everything until the command ends.
+            if ( empty( $hcpp->hcpp_filters[ $bin_command . '_output' ] ) ) {
+                $process = proc_open( $cmd, array( 0 => STDIN, 1 => STDOUT, 2 => STDERR ), $pipes, null, null );
+                exit( proc_close( $process ) );
+            }
+
             $descriptorspec = array(
                 0 => array("pipe", "r"),  // stdin is a pipe that the child will read from
                 1 => array("pipe", "w"),  // stdout is a pipe that the child will write to
